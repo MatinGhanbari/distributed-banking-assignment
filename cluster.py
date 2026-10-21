@@ -21,6 +21,19 @@ rejects client requests with NOT_PRIMARY.
 
 Peer messages use the same framing as clients: one JSON object per line, on the
 separate replication port (default 6000). Every message gets exactly one reply.
+
+Bonus 2 - split-brain prevention with a WITNESS (witness.py, --witness HOST:PORT):
+5. A primary may serve (writes AND reads) only while it holds an unexpired LEASE from
+   the witness. It renews every `lease_renew` s; its local deadline is computed from the
+   time the renew request was SENT minus a safety margin, so it stops serving before the
+   witness considers the lease expired. Without a lease it answers NO_QUORUM ("fenced").
+6. A backup can become primary only through the witness (compare-and-set): the old
+   lease must have expired (+ grace) and the old primary must have reported that this
+   backup is in sync. The witness gives out the new epoch.
+7. Before the primary acknowledges a write that is NOT replicated (degraded mode), the
+   witness must know that the backup is out of sync - so the backup can never take over
+   without those writes.
+Without --witness, everything below works as in bonus 1.
 """
 import json
 import socket
@@ -68,6 +81,7 @@ class Cluster:
         self.peer = parse_addr(cfg["peer"])
         self.peer_client = cfg["peer_client"] or f"{self.peer[0]}:{cfg['port']}"
         self.db_path = cfg["db_path"]
+        self.witness = parse_addr(cfg["witness"]) if cfg.get("witness") else None
         self.state_lock = threading.Lock()   # protects role / epoch / synced / last_contact
         self.link_lock = threading.Lock()    # protects self.link (primary -> backup socket)
         self.link = None
@@ -78,7 +92,9 @@ class Cluster:
             conn.execute("BEGIN IMMEDIATE")
             if get_state(conn, "role") is None:  # first start of this node: use --initial-role
                 set_state(conn, "role", cfg["initial_role"])
-                set_state(conn, "epoch", 1 if cfg["initial_role"] == "primary" else 0)
+                # With a witness, every epoch (also the first) is handed out by the witness.
+                first_epoch = 1 if cfg["initial_role"] == "primary" and not self.witness else 0
+                set_state(conn, "epoch", first_epoch)
                 set_state(conn, "last_lsn", 0)
             self.role = get_state(conn, "role")
             self.epoch = int(get_state(conn, "epoch"))
@@ -88,6 +104,14 @@ class Cluster:
         # "in sync" after it received a snapshot from the current primary.
         self.synced = self.role == "primary"
         self.last_contact = time.monotonic()
+        # --- bonus 2 (witness mode only) ---
+        self.lease_deadline = 0.0     # monotonic time until which we may serve as primary
+        self.lease_lost_logged = False
+        self.sync_up = False          # is the replication link to the backup up (= in sync)?
+        self.sync_seq = 0             # +1 on every link up/down change (orders the reports)
+        self.witness_seq = 0          # highest sync_seq the witness has acknowledged
+        self.last_promote_try = 0.0
+        self.last_refusal = None
 
     # ------------------------------------------------------------------ lifecycle
     def start(self):
@@ -96,7 +120,11 @@ class Cluster:
         threading.Thread(target=self.listener.serve_forever, daemon=True).start()
         self.log("cluster_start", node_id=self.node_id, role=self.role, epoch=self.epoch,
                  last_lsn=self.last_lsn, repl_port=self.cfg["repl_port"], peer=self.cfg["peer"])
-        self._startup_probe()
+        if self.witness:
+            self._startup_witness()
+            threading.Thread(target=self._lease_loop, daemon=True).start()
+        else:
+            self._startup_probe()
         threading.Thread(target=self._primary_loop, daemon=True).start()
         threading.Thread(target=self._detector_loop, daemon=True).start()
 
@@ -109,6 +137,21 @@ class Cluster:
     def is_primary(self) -> bool:
         return self.role == "primary"
 
+    def lease_ok(self) -> bool:
+        """Without a witness there is no lease (bonus 1 behaviour): always True."""
+        return self.witness is None or time.monotonic() < self.lease_deadline
+
+    def check_can_serve(self):
+        """Raise the right error if this node must not answer a client request now."""
+        if self.role != "primary":
+            raise self.not_primary_error()
+        if not self.lease_ok():
+            raise self.no_quorum_error()
+
+    def no_quorum_error(self, why="it has no valid lease from the witness") -> BankError:
+        return BankError("NO_QUORUM", f"node {self.node_id} may not serve: {why}",
+                         node_id=self.node_id, primary_hint=self.peer_client)
+
     def not_primary_error(self) -> BankError:
         return BankError("NOT_PRIMARY", f"node {self.node_id} is a backup, not the primary",
                          node_id=self.node_id, role=self.role, primary_hint=self.peer_client)
@@ -116,7 +159,7 @@ class Cluster:
     def my_info(self) -> dict:
         return {"node_id": self.node_id, "role": self.role, "epoch": self.epoch,
                 "last_lsn": self.last_lsn, "synced": self.synced,
-                "initial_role": self.cfg["initial_role"]}
+                "initial_role": self.cfg["initial_role"], "lease": self.lease_ok()}
 
     # --------------------------------------------------------------- role changes
     def _persist_role(self, role: str, epoch: int):
@@ -135,6 +178,7 @@ class Cluster:
             self.role, self.synced = "backup", False
             self.epoch = max(epoch, self.epoch)
             self.last_contact = time.monotonic()
+            self.lease_deadline = 0.0
             new_epoch = self.epoch
         self._close_link()
         self._persist_role("backup", new_epoch)
@@ -188,35 +232,38 @@ class Cluster:
     # ---------------------------------------------------- primary side: replicate
     def replicate(self, conn, request_id, balances: dict, processed_row):
         """Called by Bank.execute INSIDE the client's transaction, before COMMIT."""
-        if self.role != "primary":
-            raise self.not_primary_error()
+        self.check_can_serve()                    # role + (bonus 2) lease
         lsn = int(get_state(conn, "last_lsn")) + 1
         set_state(conn, "last_lsn", lsn)          # committed together with the balances
         record = {"type": "record", "node_id": self.node_id, "epoch": self.epoch, "lsn": lsn,
                   "request_id": request_id, "balances": balances, "processed": processed_row}
+        resp = None
         with self.link_lock:
             # Updated under link_lock, so a heartbeat never announces an lsn whose record
             # has not been sent yet.
             self.last_lsn = lsn
-            if self.link is None:
-                return                            # degraded: no backup, continue alone
-            try:
-                resp = self.link.call(record)
-            except (OSError, ValueError) as exc:
-                self._drop_link_locked(f"replication of lsn {lsn} failed: {exc!r}")
-                return
-        if resp.get("ok"):
-            return
-        if resp.get("error") == "STALE_EPOCH":    # the peer is a newer primary: we must stop
-            err = self.not_primary_error()
+            if self.link is not None:
+                try:
+                    resp = self.link.call(record)
+                except (OSError, ValueError) as exc:
+                    self._drop_link_locked(f"replication of lsn {lsn} failed: {exc!r}")
+        if resp is not None and resp.get("ok"):
+            return                                # on the backup: safe to commit
+        if resp is not None and resp.get("error") == "STALE_EPOCH":
+            err = self.not_primary_error()        # the peer is a newer primary: we must stop
             err.step_down_epoch = resp["epoch"]   # server.py steps down after the ROLLBACK
             raise err
-        self._drop_link(f"backup refused lsn {lsn}: {resp.get('error')}")
+        if resp is not None:
+            self._drop_link(f"backup refused lsn {lsn}: {resp.get('error')}")
+        # Degraded: this write exists only here. Bonus 2: the witness must know that the
+        # backup is out of sync BEFORE we commit, or the backup could take over without it.
+        self._witness_must_know_out_of_sync()
 
     def _drop_link_locked(self, reason: str):
         if self.link is not None:
             self.link.close()
             self.link = None
+            self._set_sync(False)
         if self.role == "primary" and not self.degraded:
             self.degraded = True
             self.log("degraded_mode", node_id=self.node_id, epoch=self.epoch, reason=reason,
@@ -274,6 +321,7 @@ class Cluster:
                 if result.get("ok") and self.role == "primary":
                     with self.link_lock:
                         self.link = peer
+                    self._set_sync(True)          # witness learns it with the next renew
             except (OSError, ValueError) as exc:
                 result = {"ok": False, "error": repr(exc)}
             finally:
@@ -283,6 +331,8 @@ class Cluster:
             self.log("snapshot_sent", node_id=self.node_id, epoch=self.epoch, lsn=snapshot["lsn"],
                      accounts=len(snapshot["accounts"]), processed=len(snapshot["processed"]),
                      note="backup in sync, synchronous replication active")
+            if self.witness:
+                self._renew_lease()               # tell the witness right away: in sync again
             return
         peer.close()
         if result.get("error") == "STALE_EPOCH":
@@ -296,7 +346,8 @@ class Cluster:
                 return
             try:
                 resp = self.link.call({"type": "heartbeat", "node_id": self.node_id,
-                                       "epoch": self.epoch, "lsn": self.last_lsn})
+                                       "epoch": self.epoch, "lsn": self.last_lsn,
+                                       "lease": self.lease_ok()})
             except (OSError, ValueError) as exc:
                 self._drop_link_locked(f"heartbeat failed: {exc!r}")
                 return
@@ -322,6 +373,16 @@ class Cluster:
                              reason="this backup never received a snapshot, its data may be old")
                     warned = True
                 continue
+            if self.witness:
+                if self.epoch == 0:
+                    if not warned:
+                        self.log("cannot_promote", node_id=self.node_id, silent_s=round(silent, 2),
+                                 reason="no primary has held a lease yet (waiting for the "
+                                        "initial primary)")
+                        warned = True
+                elif time.monotonic() - self.last_promote_try >= 0.5:
+                    self._promote_via_witness(silent)
+                continue
             self.log("primary_failure_detected", node_id=self.node_id, silent_s=round(silent, 2))
             self._promote(f"no heartbeat from primary for {silent:.1f}s")
 
@@ -333,6 +394,8 @@ class Cluster:
             return self.my_info()
         if kind == "heartbeat":
             return self._on_heartbeat(msg)
+        if kind == "status":                     # read-only, used by the demos
+            return {**self.my_info(), **bank_db.digest(conn)}
         if kind in ("record", "snapshot"):
             return self._apply(conn, msg)
         return {"ok": False, "error": "UNKNOWN_MESSAGE"}
@@ -349,10 +412,22 @@ class Cluster:
             return refused
         if self.role == "primary":               # a newer primary exists
             self.step_down(msg["epoch"], f"heartbeat from newer primary {msg['node_id']}")
+        adopt = None
         with self.state_lock:
-            self.last_contact = time.monotonic()
+            if msg.get("lease", True):           # a fenced primary (no lease) counts as silent
+                self.last_contact = time.monotonic()
             if msg["lsn"] > self.last_lsn:       # primary wrote something we never got
                 self.synced = False
+            if self.synced and msg["epoch"] > self.epoch and msg["lsn"] == self.last_lsn:
+                # Same data, newer epoch (e.g. the primary got its first lease after it sent
+                # us the snapshot): remember the epoch so we may take over from it.
+                self.epoch = adopt = msg["epoch"]
+        if adopt is not None:
+            with closing(bank_db.connect(self.db_path)) as c:
+                c.execute("BEGIN IMMEDIATE")      # only if nothing newer happened meanwhile
+                if get_state(c, "role") == "backup" and int(get_state(c, "epoch")) < adopt:
+                    set_state(c, "epoch", adopt)
+                c.execute("COMMIT")
         if not self.synced:
             return {"ok": False, "error": "NEED_SNAPSHOT"}
         return {"ok": True}
@@ -421,6 +496,153 @@ class Cluster:
     def _touch(self):
         with self.state_lock:
             self.last_contact = time.monotonic()
+
+
+    # ------------------------------------------------- bonus 2: witness and lease
+    def _witness_call(self, msg: dict) -> dict:
+        conn = PeerConnection(self.witness, timeout=self.cfg["witness_timeout"])
+        try:
+            return conn.call(msg)
+        finally:
+            conn.close()
+
+    def _set_sync(self, up: bool):
+        """Record a change of the link state; the witness hears about it with sync_seq."""
+        with self.state_lock:
+            if self.sync_up != up:
+                self.sync_up = up
+                self.sync_seq += 1
+
+    def _startup_witness(self):
+        """A (re)starting node asks the witness who the primary is before serving."""
+        status, deadline = None, time.monotonic() + self.cfg["startup_probe"]
+        while status is None and not self.stopping.is_set():
+            try:
+                status = self._witness_call({"type": "status"})
+            except (OSError, ValueError):
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.3)
+        if status is None:
+            self.log("startup_witness", reachable=False, role=self.role, epoch=self.epoch,
+                     note="no lease without the witness: this node will not serve as primary "
+                          "until the witness answers")
+            return
+        self.log("startup_witness", reachable=True, witness=status, my_role=self.role,
+                 my_epoch=self.epoch)
+        holder = status.get("holder")
+        if holder not in (None, self.node_id):
+            # Someone else is (or was last) primary: we are backup and must resync from it.
+            self.step_down(status["epoch"], f"witness says {holder} is primary at epoch "
+                                            f"{status['epoch']}")
+        elif holder == self.node_id and self.role != "primary":
+            # The witness granted us the lease but we crashed before persisting it.
+            self._persist_role("primary", status["epoch"])
+            with self.state_lock:
+                self.role, self.epoch, self.synced = "primary", status["epoch"], True
+
+    def _lease_loop(self):
+        """Primary: renew the lease every lease_renew seconds; log when we become fenced."""
+        reason = None
+        while not self.stopping.is_set():
+            wait = self.cfg["lease_renew"]
+            if self.role == "primary":
+                if reason is not None and not self.lease_ok() and not self.lease_lost_logged:
+                    self.lease_lost_logged = True
+                    self.log("lease_lost", node_id=self.node_id, epoch=self.epoch, reason=reason,
+                             note="FENCED: refusing all client requests with NO_QUORUM")
+                reason = self._renew_lease()
+                remaining = self.lease_deadline - time.monotonic()
+                if reason is not None and remaining > 0:
+                    # Still valid: wake up exactly when it runs out, so the log shows the
+                    # real moment we stopped serving.
+                    wait = min(wait, remaining + 0.005)
+                elif reason is not None:
+                    wait = min(wait, 0.2) if not self.lease_lost_logged else wait
+            else:
+                reason = None
+            self.stopping.wait(wait)
+
+    def _renew_lease(self):
+        """Ask the witness for (a renewal of) our lease. Returns None on success, else why not."""
+        with self.state_lock:
+            epoch, seq, up = self.epoch, self.sync_seq, self.sync_up
+        sent_at = time.monotonic()               # the lease counts from the SEND time
+        try:
+            resp = self._witness_call({"type": "acquire", "node_id": self.node_id, "epoch": epoch,
+                                       "ttl": self.cfg["lease_ttl"], "in_sync": up,
+                                       "sync_seq": seq})
+        except (OSError, ValueError) as exc:
+            return f"witness unreachable: {exc!r}"
+        if not resp.get("ok"):
+            if resp.get("holder") not in (None, self.node_id):
+                self.step_down(resp["epoch"], f"witness: {resp['holder']} holds the lease at "
+                                              f"epoch {resp['epoch']}")
+            return resp.get("reason", "refused")
+        if resp["epoch"] != epoch:               # granted (bootstrap) or adopted a newer epoch
+            self._persist_role("primary", resp["epoch"])
+        with self.state_lock:
+            if self.role != "primary":
+                return "stepped down meanwhile"
+            self.epoch = resp["epoch"]
+            if resp.get("granted"):
+                self.witness_seq = 0             # the witness reset its sync info
+                self.log("lease_granted", node_id=self.node_id, epoch=self.epoch)
+            else:
+                self.witness_seq = max(self.witness_seq, seq)
+            # Conservative: the witness started counting AFTER we sent, we count from send
+            # time and stop `lease_margin` seconds early on top of that.
+            self.lease_deadline = sent_at + self.cfg["lease_ttl"] - self.cfg["lease_margin"]
+        if self.lease_lost_logged:
+            self.lease_lost_logged = False
+            self.log("lease_restored", node_id=self.node_id, epoch=self.epoch)
+        return None
+
+    def _witness_must_know_out_of_sync(self):
+        """Degraded write: make sure the witness knows the backup is behind, else refuse."""
+        if self.witness is None:
+            return                               # bonus 1: just continue alone
+        with self.state_lock:
+            known = self.witness_seq >= self.sync_seq
+        if known:
+            return
+        reason = self._renew_lease()             # carries in_sync=false + the new sync_seq
+        with self.state_lock:
+            known = self.witness_seq >= self.sync_seq
+        if reason is not None or not known:
+            raise self.no_quorum_error("the backup is unreachable and the witness could not be "
+                                       "told so; refusing to write without either")
+
+    def _promote_via_witness(self, silent: float):
+        """Backup: ask the witness for the lease (compare-and-set on the epoch)."""
+        self.last_promote_try = time.monotonic()
+        sent_at = time.monotonic()
+        try:
+            resp = self._witness_call({"type": "acquire", "node_id": self.node_id,
+                                       "epoch": self.epoch, "ttl": self.cfg["lease_ttl"]})
+        except (OSError, ValueError) as exc:
+            resp = {"ok": False, "reason": f"witness unreachable: {exc!r}"}
+        if not resp.get("ok"):
+            if resp.get("reason", "").split(" (")[0] != self.last_refusal:
+                self.last_refusal = resp.get("reason", "").split(" (")[0]
+                self.log("promotion_refused", node_id=self.node_id, silent_s=round(silent, 2),
+                         reason=resp.get("reason"))
+            return
+        self.last_refusal = None
+        with closing(bank_db.connect(self.db_path)) as conn:
+            conn.execute("BEGIN IMMEDIATE")      # serialised with replication records
+            set_state(conn, "role", "primary")
+            set_state(conn, "epoch", resp["epoch"])
+            conn.execute("COMMIT")
+        with self.state_lock:
+            self.role, self.epoch, self.synced = "primary", resp["epoch"], True
+            self.sync_up, self.sync_seq, self.witness_seq = False, 0, 0
+            self.lease_deadline = sent_at + self.cfg["lease_ttl"] - self.cfg["lease_margin"]
+            self.lease_lost_logged = False
+        self.degraded = False
+        self.log("promoted", node_id=self.node_id, epoch=resp["epoch"], last_lsn=self.last_lsn,
+                 reason=f"no heartbeat from a lease-holding primary for {silent:.1f}s; "
+                        "the witness granted the lease (2 of 3 votes)")
 
 
 class _PeerHandler(socketserver.StreamRequestHandler):

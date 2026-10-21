@@ -17,5 +17,11 @@
   "heartbeat_interval": 0.5,
   "failover_timeout": 3.0,
   "repl_timeout": 2.0,
-  "startup_probe": 2.0
+  "startup_probe": 2.0,
+
+  "witness": null,
+  "lease_ttl": 3.0,
+  "lease_renew": 1.0,
+  "lease_margin": 0.5,
+  "witness_timeout": 1.0
 }

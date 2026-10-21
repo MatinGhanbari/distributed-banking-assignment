@@ -3,3 +3,4 @@ bank.db-*
 logs/
 __pycache__/
 *.pyc
+witness_state.json*

@@ -13,6 +13,8 @@ data after a crash.
 The design is explained in [docs/design-notes.md](docs/design-notes.md).
 **Advanced Bonus** (primary/backup cluster with automatic failover): see
 [the bonus section below](#advanced-bonus-primarybackup-cluster-with-automatic-failover).
+**Bonus 2** (split-brain prevention with a witness and leases): see
+[Bonus 2 below](#bonus-2-split-brain-prevention-witness--leases).
 
 ## Files
 
@@ -20,13 +22,19 @@ The design is explained in [docs/design-notes.md](docs/design-notes.md).
 server.py              TCP server: config, threads, MAX_CLIENTS, logging, shutdown
 protocol.py            request parsing/validation (amounts as Decimal -> integer cents), responses
 bank_db.py             SQLite schema, seeding, ACID transactions, idempotency
-cluster.py             bonus: replication, heartbeats, failover, epochs, rejoin/snapshot
+cluster.py             bonus: replication, heartbeats, failover, epochs, rejoin/snapshot;
+                       bonus 2: leases from the witness, fencing, CAS promotion
+witness.py             bonus 2: witness/arbiter (lease + epoch authority) for the client VM
 client.py              interactive / one-shot client (also used by demos and tests);
                        FailoverClient = bonus client that retries on the other server
 config.json            default configuration
 demo/                  demo scripts (see below)
 tests/test_bank.py     automated tests (unittest), part 1
 tests/test_cluster.py  automated tests for the bonus cluster
+tests/test_witness.py  automated tests for bonus 2 (witness, leases, fencing)
+demo/split_brain_demo.py  bonus 2 demo: partitions + 5 split-brain checks
+demo/netproxy.py       bonus 2: TCP proxy that simulates partitions on one machine
+demo/vm_partition.sh   bonus 2: iptables partition / heal commands for Server A
 docs/design-notes.md   design notes for the report
 ```
 
@@ -236,11 +244,125 @@ restarts A, checks that A rejoined as backup with identical balances):
 python3 demo/failover_demo.py --local            # ~25 s
 ```
 
+## Bonus 2: split-brain prevention (witness + leases)
+
+Bonus 1 cannot tell "A crashed" from "the A–B link is broken": in a partition both nodes could
+serve writes. Bonus 2 adds a **third vote**, a tiny **witness** process on the client VM, and
+**leases**:
+
+* The primary may answer *any* client request (writes **and** reads) only while it holds an
+  unexpired lease from the witness (TTL 3 s, renewed every 1 s). Its local deadline is
+  `send time of the renew request + 3 s − 0.5 s margin`, i.e. it stops *before* the witness
+  considers the lease expired. Without a lease it answers `NO_QUORUM` and logs `lease_lost`.
+* A backup becomes primary only if the witness grants it the lease (atomic compare-and-set):
+  the old lease must have expired (+1 s grace) **and** the old primary must have reported the
+  backup as in sync. Node + witness = 2 of 3 votes. Each grant gets a new, higher epoch, written
+  to disk (fsync) by the witness before it answers.
+* If A loses the link to B but still reaches the witness, A keeps its lease and serves alone
+  (degraded) – but only after the witness has recorded "B is NOT in sync", so B can never take
+  over without A's newest writes. B's promotion attempts are refused (`promotion_refused`).
+* If A is cut off from B **and** the witness, A fences itself within the lease time, and only
+  after that (≥ 1.5 s later: margin + grace) the witness gives the lease to B (epoch + 1).
+* Everything with an older epoch (records, heartbeats, snapshots) is refused (`STALE_EPOCH`);
+  a node that sees a higher epoch steps down. A restarting node asks the witness first; if
+  another node holds the lease it starts as backup and resyncs.
+* **Witness down ⇒ no writes and no reads** (the primary's lease expires, nobody can be
+  promoted). This is the deliberate CP choice; there is no "fail-open" switch because it would
+  bring split brain back. Restarting the witness restores service (state is on disk).
+* Without `--witness` everything behaves exactly like Bonus 1; without `--peer` like part 1.
+
+Design and correctness argument: [docs/design-notes.md, section 10](docs/design-notes.md).
+
+### Start on the three VMs
+
+Start from fresh state the first time (`rm -f bank.db*` on A and B, `rm -f witness_state.json`
+on the client VM). Allow the ports if ufw is enabled.
+
+**Client VM (192.168.75.20) – witness, terminal 1:**
+```bash
+cd bank-assignment
+sudo ufw allow 7000/tcp                       # only if ufw is enabled
+python3 witness.py --port 7000                # state: witness_state.json, log: logs/witness.log
+```
+**Server A (192.168.75.10):**
+```bash
+cd bank-assignment
+sudo ufw allow 5000/tcp; sudo ufw allow 6000/tcp
+python3 server.py --node-id A --initial-role primary --peer 192.168.75.11:6000 --witness 192.168.75.20:7000
+```
+**Server B (192.168.75.11):**
+```bash
+cd bank-assignment
+sudo ufw allow 5000/tcp; sudo ufw allow 6000/tcp
+python3 server.py --node-id B --initial-role backup --peer 192.168.75.10:6000 --witness 192.168.75.20:7000
+```
+(or `export BANK_WITNESS=192.168.75.20:7000`). A logs `lease_granted epoch 1`, B logs
+`snapshot_applied`, the witness logs `lease_granted` and `sync_report in_sync true`.
+Witness state at any time (from any VM): `python3 witness.py --status 192.168.75.20:7000`.
+
+**Client VM, terminal 2 – the split-brain demo:**
+```bash
+cd bank-assignment
+python3 demo/split_brain_demo.py --servers 192.168.75.10:5000,192.168.75.11:5000 \
+    --repl 192.168.75.10:6000,192.168.75.11:6000 --witness 127.0.0.1:7000
+```
+Its client threads send every attempt to a *random* server (directly to both client ports).
+The script asks you to run, **on Server A** (as root), one after another:
+```bash
+sudo bash demo/vm_partition.sh cut-link   # A<->B cut; both still reach the witness
+                                          # expect: B "promotion_refused", A keeps serving (degraded)
+sudo bash demo/vm_partition.sh heal       # A re-syncs B (snapshot_sent), witness in_sync true
+sudo bash demo/vm_partition.sh cut-all    # A cut from B and from witness port 7000
+                                          # expect: A "lease_lost" (NO_QUORUM), ~1.6 s later B "promoted epoch 2"
+sudo bash demo/vm_partition.sh heal       # A: role_change -> backup, snapshot_applied
+```
+The raw iptables rules the script uses (own chain `BANKPART`, so `heal` touches nothing else):
+```bash
+# cut-link
+sudo iptables -N BANKPART; sudo iptables -I INPUT 1 -j BANKPART; sudo iptables -I OUTPUT 1 -j BANKPART
+sudo iptables -A BANKPART -s 192.168.75.11 -j DROP
+sudo iptables -A BANKPART -d 192.168.75.11 -j DROP
+# cut-all = cut-link plus (only the witness port: clients on .20 still reach A:5000)
+sudo iptables -A BANKPART -d 192.168.75.20 -p tcp --dport 7000 -j DROP
+sudo iptables -A BANKPART -s 192.168.75.20 -p tcp --sport 7000 -j DROP
+# heal
+sudo iptables -D INPUT -j BANKPART; sudo iptables -D OUTPUT -j BANKPART
+sudo iptables -F BANKPART; sudo iptables -X BANKPART
+```
+At the end the demo prints PASS/FAIL for: (1) no overlapping acks of two primaries (every
+answer carries `served_by` and `epoch`; no answer of an older epoch may have been sent after an
+answer of a newer epoch was received), (2) final balances == initial + acknowledged operations,
+(3) each request_id acknowledged once, (4) the old primary stepped down and has the same data
+digest as the new primary (read via the replication ports' `status` message), (5) no
+acknowledged write lost (re-sending every acknowledged id only gives `replayed`).
+
+Other things to show: stop the witness (Ctrl+C) → within ~2.5 s every request on A gets
+`NO_QUORUM` and B does **not** promote; start it again → A logs `lease_restored`. Or `kill -9`
+A, wait until B is primary, stop B, start A alone → A logs `startup_witness ... witness says B is
+primary` and answers `NOT_PRIMARY`.
+
+### Single machine version
+```bash
+python3 demo/split_brain_demo.py --local                    # ~35 s, all checks PASS
+python3 demo/split_brain_demo.py --local --without-witness  # negative control: same scenario
+                                                            # with Bonus 1 nodes -> checks FAIL
+```
+`--local` starts the witness, A and B, and puts TCP proxies (`demo/netproxy.py`) on the A→B,
+B→A and A→witness connections. `cut()` throws bytes away like an iptables DROP (connections
+stay open, the peer only sees timeouts); clients connect directly, as in the VM setup.
+
+New settings (config.json / env / CLI): `witness` (`BANK_WITNESS`, `--witness`), `lease_ttl`
+3.0 (`--lease-ttl`), `lease_renew` 1.0 (`--lease-renew`), `lease_margin` 0.5
+(`--lease-margin`), `witness_timeout` 1.0 (`--witness-timeout`); the server refuses to start
+unless `lease_renew + witness_timeout < lease_ttl − lease_margin`. Witness: `--port` (7000,
+`BANK_WITNESS_PORT`), `--state`, `--log-file`, `--grace` (1.0).
+
 ## Tests
 
 ```bash
 python3 -m unittest -v tests/test_bank.py        # part 1 (13 tests)
 python3 -m unittest -v tests/test_cluster.py     # bonus cluster (6 tests, ~20 s)
+python3 -m unittest -v tests/test_witness.py     # bonus 2 (12 tests, ~30 s)
 ```
 Each test class starts its own server process on a free port with a temporary database
 (your `bank.db` is not touched). Covers: amount validation, config precedence,
@@ -250,3 +372,9 @@ kill -9 durability and graceful SIGTERM shutdown. The cluster tests cover: NOT_P
 backup, data on the backup before the ack, `kill -9` of the primary under load (balances exact,
 both servers used), replayed answer after failover, the "replicated but not committed" crash
 (`simulate_crash`, needs fault injection), and the old primary rejoining as backup and syncing.
+The bonus 2 tests cover the witness compare-and-set (refused while the lease runs and during the
+grace period, refused if the backup is not in sync, reordered sync reports, stale epochs,
+restart keeps state and holds the lease for one TTL) and, with real processes: lease expiry
+fences the primary when the witness dies (and B does not promote), no promotion while the lease
+is held (A–B cut), isolated primary fences then B promotes + stale-epoch records/heartbeats are
+refused, a lone restart does not become primary, a restart without the witness does not serve.

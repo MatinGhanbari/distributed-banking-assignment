@@ -72,6 +72,15 @@ def set_state(conn: sqlite3.Connection, key: str, value) -> None:
     conn.execute("INSERT OR REPLACE INTO node_state VALUES (?, ?)", (key, str(value)))
 
 
+def digest(conn: sqlite3.Connection) -> dict:
+    """Balances + a short fingerprint of all data (used to compare two replicas)."""
+    import hashlib
+    accounts = conn.execute("SELECT account_id, balance_cents FROM accounts ORDER BY 1").fetchall()
+    ids = conn.execute("SELECT request_id FROM processed_requests ORDER BY 1").fetchall()
+    h = hashlib.sha256(json.dumps([accounts, ids]).encode()).hexdigest()[:16]
+    return {"balances": dict(accounts), "processed": len(ids), "digest": h}
+
+
 class Bank:
     """Executes validated requests against the database (one instance per client thread)."""
 

@@ -213,6 +213,8 @@ exactly, and the restarted A had the same balances as B.
 
 ### 9.6 Limitations (honest list)
 
+* *(Solved by Bonus 2 when a witness is configured – see section 10. The next three points
+  describe Bonus 1 without `--witness`.)*
 * **Network partition / split brain (the "extreme" bonus) is not solved.** With two nodes, the
   backup cannot tell "A crashed" from "the link to A is broken". If the link breaks while A is
   alive, B promotes after 3 s while A continues in degraded mode. Clients that can still reach A
@@ -236,3 +238,117 @@ exactly, and the restarted A had the same balances as B.
 * The primary keeps the write lock while waiting for the backup's ack (max `repl_timeout` = 2 s);
   if the backup is very slow, clients wait that long before the primary goes degraded.
 * The replication port is plain TCP without authentication, so only use it on the lab network.
+
+
+## 10. Bonus 2 – split-brain prevention with a witness and leases
+
+### 10.1 The problem
+With two nodes, B cannot distinguish "A crashed" from "the A–B link is broken". Bonus 1 promotes
+B after 3 s of silence, so in a partition **both** nodes accept writes; on healing, B's higher
+epoch wins and A's partition-time writes are thrown away (the negative control
+`split_brain_demo.py --local --without-witness` shows exactly this: overlapping epochs, wrong
+final balances, lost acknowledged writes). Any fix needs a third party that breaks the tie.
+
+### 10.2 The witness (`witness.py`, client VM, port 7000)
+A small TCP JSON-lines server that stores only `{epoch, holder, in_sync, sync_seq, ttl}`. It is
+not a full replica (it holds no bank data), but it is a vote: a node can act as primary only with
+the witness's agreement, i.e. 2 of 3 (node + witness). Its one operation is
+`acquire(node, epoch, ttl, in_sync, sync_seq)`:
+
+* **holder renews**: lease expiry := now + ttl; a newer sync report (higher `sync_seq`) updates
+  `in_sync`.
+* **anyone else** (compare-and-set): granted only if `now > expiry + grace` **and** the old
+  holder's last report said the backup is in sync **and** the caller's epoch is not stale. Then
+  `epoch := max(epoch, caller's epoch) + 1`, holder := caller.
+
+Every change of epoch/holder/in_sync is written to `witness_state.json` with
+write-temp + `fsync` + `os.replace` + directory `fsync` **before** the reply is sent, so a
+witness crash can never "forget" a grant. After a restart the witness does not know when the last
+lease was issued, so it conservatively treats the holder's lease as valid for one more TTL.
+Requests are handled under one lock, so two simultaneous promotion attempts cannot both win.
+
+### 10.3 Leases and fencing on the servers (`cluster.py`)
+* The primary renews every `lease_renew` = 1 s. Its deadline is
+  `t_send + lease_ttl − lease_margin` (3 − 0.5 = 2.5 s after the moment it *sent* the renew).
+  The witness's expiry is `t_receive + 3 s ≥ t_send + 3 s`, so the node's deadline is always at
+  least `margin` (0.5 s) earlier than the witness's, and the witness adds `grace` (1 s) more
+  before granting the lease to anyone else. Gap between "A stops" and "B may start": ≥ 1.5 s
+  (measured 1.60 s in the local runs).
+* `check_can_serve()` runs **before** every client request (reads too – a fenced primary might
+  have stale data, so linearizable reads also need the lease). It is checked again **after**
+  the transaction: if the lease ran out while the request ran, the answer is replaced by
+  `NO_QUORUM` (the write may already be committed – it is then on B, or the witness knows B is
+  behind – and the client's retry with the same `request_id` gets the stored answer from the real
+  primary). So every acknowledgement is sent inside a lease window.
+* Without a lease: `NO_QUORUM` (with `primary_hint`), `lease_lost ... FENCED` in the log; when a
+  renew succeeds again: `lease_restored`. A backup still answers `NOT_PRIMARY`.
+* Heartbeats carry `lease: true/false`; a heartbeat from a fenced primary does not count as
+  "alive", so B can take over from a primary that only lost the witness.
+* Startup in witness mode: the first epoch is 0 (no primary yet); epoch 1 is the first grant.
+  A (re)starting node asks the witness for its status first: if another node holds the lease it
+  steps down to backup and waits for a snapshot; if the witness is unreachable it does not get a
+  lease and serves nothing. A backup at epoch 0 (that has never followed a lease holder) does not
+  try to promote.
+
+### 10.4 The in-sync rule (no acknowledged write lost)
+B's promotion also requires the witness's `in_sync = true`. The primary reports the link state
+with every renew; `sync_seq` increases at every link up/down change, the witness ignores older
+reports (renews can overlap). The important rule is on the write path: when the replication link
+is down (degraded mode), A may commit a write **only after the witness has acknowledged the
+out-of-sync report** (`witness_seq ≥ sync_seq`); if the witness cannot be told, the write is
+rolled back with `NO_QUORUM`. Hence: if B has missed any acknowledged write, the witness knows
+it, and B can never become primary (it would need A back first). This closes the Bonus 1 window
+"A degraded, writes alone, crashes, B takes over without those writes". After the link is back A
+sends a snapshot (under the write lock) and immediately reports `in_sync = true`.
+
+### 10.5 Partition cases
+| situation | what happens |
+|---|---|
+| A–B cut, both reach witness | A keeps the lease and serves **degraded** (writes go to A only, witness knows B is behind). B's attempts are refused (`lease held by A`). After healing A resyncs B. *Decision:* staying available is safe here because only one node can hold the lease; B only becomes useful again after the snapshot. |
+| A cut from B and witness (clients still reach A) | A cannot renew → stops serving at its deadline (≤ 2.5 s after the last renew, logs `lease_lost`). Writes in flight fail (cannot replicate, cannot tell the witness) → rolled back, `NO_QUORUM`. Witness expiry + 1 s grace later B gets the lease (epoch + 1). On healing A sees B's higher epoch (witness, hello, or `STALE_EPOCH` from B), steps down and takes B's snapshot. |
+| A cut from witness only | A fences, its heartbeats say `lease: false`, B promotes; A steps down on B's higher epoch. |
+| B cut from witness only | nothing changes (A holds the lease); B just could not promote. |
+| witness down | A's lease expires → **no reads, no writes** anywhere (CP). No one can be promoted. Witness restart → A renews (same epoch) → service resumes. |
+| A crashes | like Bonus 1, but B promotes only after A's lease has expired (≈ 3–4 s instead of 3 s). |
+| A restarts alone after B took over | A asks the witness, sees holder B → stays backup (safe, unavailable until B returns). |
+
+At no instant can two nodes serve: a node serves only before its own lease deadline, and the
+witness grants a new lease only `margin + grace` after the old deadline. Epoch fencing is the
+second line of defence: a record, heartbeat or snapshot with an older epoch is refused with
+`STALE_EPOCH`, and any node that sees a higher epoch steps down.
+
+### 10.6 Clocks
+The protocol uses only **durations measured on each machine's monotonic clock** – never wall
+clock time and never a comparison of two machines' clocks, so NTP jumps and clock offsets do not
+matter. What it does assume is **bounded clock drift**: while the witness measures 3 s (+1 s
+grace), A's clock must not measure less than 2.5 s. That tolerates rate differences of ≈ 30 %,
+far more than real quartz clocks (≈ 0.01 %). It also assumes a process is not paused for longer
+than the margin between "I checked the lease" and "my answer is on the wire" (a VM freeze or a
+long GC/swap stall could break this – the classic lease caveat; real systems add fencing tokens
+at the storage layer). Note the **data** safety argument (no lost acknowledged write, no
+divergence) does not depend on clocks at all: writes in link mode need B's acceptance, and B
+refuses older epochs after promotion; degraded writes need the witness's ack that B is behind.
+Clocks only matter for read linearizability and for "never two nodes answering at the same
+instant".
+
+### 10.7 CAP trade-off
+The system is **CP**: during a partition it stays consistent and gives up availability on the
+minority side (and entirely when the witness is down or when A dies while B is out of sync). We
+deliberately did **not** add a "fail-open" flag: serving without the witness is exactly the
+split-brain scenario we are preventing, so the only "available" mode is to run without
+`--witness`, which is Bonus 1 with its documented weakness.
+
+### 10.8 Remaining limits (honest list)
+* The witness is a **single point of unavailability** (not of inconsistency). A real system would
+  use 3–5 full replicas with a consensus protocol (Raft/Paxos) or a replicated lock service.
+* Bounded drift / process pause assumption (10.6).
+* If A dies while B is out of sync, the cluster is unavailable until A returns (by design – B
+  does not have all acknowledged writes).
+* A write that commits on A but whose answer is replaced by `NO_QUORUM` (lease expired during the
+  request) is "applied but not acknowledged"; the client must retry with the same `request_id`
+  (`FailoverClient` does) – this is the same contract as a lost answer.
+* Failover takes longer than in Bonus 1 (lease TTL + grace ≈ 3.5–4 s); the gap without answers in
+  the demos was ≈ 3–3.7 s.
+* No authentication on the witness and replication ports (lab network only).
+* With the iptables partition, existing TCP connections hang until timeouts fire (as in a real
+  partition); the local proxy closes them on heal instead – both sides reconnect either way.

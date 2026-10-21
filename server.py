@@ -51,6 +51,12 @@ DEFAULTS = {
     "failover_timeout": 3.0,          # backup promotes itself after this much silence
     "repl_timeout": 2.0,              # max wait for the backup's ack of one record
     "startup_probe": 2.0,             # how long to look for the peer at startup
+    # --- bonus 2: witness / leases (only used when "witness" is set) ---
+    "witness": None,                  # witness address, e.g. "192.168.75.20:7000"
+    "lease_ttl": 3.0,                 # lease length requested from the witness
+    "lease_renew": 1.0,               # renew interval
+    "lease_margin": 0.5,              # stop serving this much BEFORE the witness's expiry
+    "witness_timeout": 1.0,           # max wait for one witness answer
 }
 # config key -> (environment variable, type)
 ENV_VARS = {
@@ -69,6 +75,11 @@ ENV_VARS = {
     "initial_role": ("BANK_INITIAL_ROLE", str),
     "heartbeat_interval": ("BANK_HEARTBEAT_INTERVAL", float),
     "failover_timeout": ("BANK_FAILOVER_TIMEOUT", float),
+    "witness": ("BANK_WITNESS", str),
+    "lease_ttl": ("BANK_LEASE_TTL", float),
+    "lease_renew": ("BANK_LEASE_RENEW", float),
+    "lease_margin": ("BANK_LEASE_MARGIN", float),
+    "witness_timeout": ("BANK_WITNESS_TIMEOUT", float),
 }
 
 log = logging.getLogger("bank")
@@ -97,6 +108,11 @@ def load_config(argv=None) -> dict:
     bonus.add_argument("--initial-role", dest="initial_role", choices=["primary", "backup"])
     bonus.add_argument("--heartbeat-interval", dest="heartbeat_interval", type=float)
     bonus.add_argument("--failover-timeout", dest="failover_timeout", type=float)
+    bonus.add_argument("--witness", help="bonus 2: witness address HOST:PORT (enables leases)")
+    bonus.add_argument("--lease-ttl", dest="lease_ttl", type=float)
+    bonus.add_argument("--lease-renew", dest="lease_renew", type=float)
+    bonus.add_argument("--lease-margin", dest="lease_margin", type=float)
+    bonus.add_argument("--witness-timeout", dest="witness_timeout", type=float)
     args = ap.parse_args(argv)
 
     cfg = dict(DEFAULTS)
@@ -117,6 +133,9 @@ def load_config(argv=None) -> dict:
     if cfg["initial_role"] not in ("primary", "backup"):
         ap.error("initial_role must be 'primary' or 'backup'")
     cfg["node_id"] = cfg["node_id"] or socket.gethostname()
+    if cfg["witness"] and not cfg["lease_renew"] + cfg["witness_timeout"] < \
+            cfg["lease_ttl"] - cfg["lease_margin"]:
+        ap.error("lease settings: need lease_renew + witness_timeout < lease_ttl - lease_margin")
     return cfg
 
 
@@ -202,6 +221,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
         t0 = time.perf_counter()
         request_id = "srv-" + uuid.uuid4().hex[:12]        # used if client sent none
         action = account = None
+        cluster = self.server.cluster
+        served = False                     # did this node act as primary for this request?
         try:
             if too_long:
                 raise BankError("MALFORMED_REQUEST",
@@ -209,9 +230,9 @@ class ClientHandler(socketserver.BaseRequestHandler):
             obj = protocol.parse_line(line)
             request_id = protocol.request_id_of(obj, request_id)
             action, account = obj.get("action"), obj.get("account")   # for logging only
-            cluster = self.server.cluster
-            if cluster is not None and not cluster.is_primary():
-                raise cluster.not_primary_error()                    # backup: redirect client
+            if cluster is not None:
+                cluster.check_can_serve()         # backup -> NOT_PRIMARY, no lease -> NO_QUORUM
+                served = True
             req = protocol.validate(obj, request_id)
             response = bank.execute(req)
         except BankError as err:
@@ -223,13 +244,24 @@ class ClientHandler(socketserver.BaseRequestHandler):
             log_event("internal_error", request_id=request_id, error=repr(exc))
             response = protocol.error_response(request_id, BankError(
                 "INTERNAL_ERROR", "internal server error; the operation was rolled back"))
+        if served and response.get("code") not in ("NOT_PRIMARY", "NO_QUORUM"):
+            if not cluster.lease_ok():
+                # Bonus 2: the lease ran out while we worked. A write may be committed (then it
+                # is on the backup, or the witness knows the backup is behind) - but we must
+                # not answer any more: another node may be primary by now. The client retries
+                # with the same request_id and gets the stored answer from the real primary.
+                response = protocol.error_response(request_id, cluster.no_quorum_error(
+                    "its lease expired while the request ran; retry with the same request_id"))
+            else:
+                response = {**response, "served_by": cluster.node_id, "epoch": cluster.epoch}
         log_event("request", request_id=request_id, client_ip=self.ip, client_port=self.port,
                   action=action if isinstance(action, str) else None,
                   account=account if isinstance(account, str) else None,
                   to_account=response.get("to_account"), amount=response.get("amount"),
                   result="success" if response["status"] == "success" else response["code"],
                   balance=response.get("balance"), replayed=response.get("replayed", False),
-                  latency_ms=round((time.perf_counter() - t0) * 1000, 3))
+                  latency_ms=round((time.perf_counter() - t0) * 1000, 3),
+                  **({"node_id": cluster.node_id, "epoch": cluster.epoch} if cluster else {}))
         return response
 
 

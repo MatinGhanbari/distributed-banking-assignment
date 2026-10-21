@@ -83,12 +83,12 @@ class FailoverClient:
     """Bonus: talks to a primary/backup pair and survives the primary's crash.
 
     Every request gets a request_id. If the connection breaks, times out, or the server
-    answers NOT_PRIMARY / SERVER_BUSY, the SAME bytes (same request_id) are sent to the next
+    answers NOT_PRIMARY / SERVER_BUSY / NO_QUORUM (bonus 2), the SAME bytes (same request_id) are sent to the next
     server, with a small backoff, until an answer arrives or `deadline` seconds pass.
     Because the servers remember processed request_ids (and replicate them), a retry can
     never apply a transaction twice: it is either applied once or answered with replayed=true.
     """
-    RETRY_CODES = {"NOT_PRIMARY", "SERVER_BUSY"}
+    RETRY_CODES = {"NOT_PRIMARY", "SERVER_BUSY", "NO_QUORUM"}
 
     def __init__(self, servers, deadline: float = 30.0, timeout: float = 5.0, on_retry=None):
         self.servers = [parse_server(s) for s in servers]
