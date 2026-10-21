@@ -16,6 +16,10 @@ The design is explained in [docs/design-notes.md](docs/design-notes.md).
 **Bonus 2** (split-brain prevention with a witness and leases): see
 [Bonus 2 below](#bonus-2-split-brain-prevention-witness--leases).
 
+**Submission material:** report (Persian, 5 A4 pages): [docs/report.pdf](docs/report.pdf) ·
+video script: [docs/video-script.md](docs/video-script.md) ·
+demo video: submitted via the course LMS (`video.mp4`, about 12:49)
+
 ## Files
 
 ```
@@ -67,6 +71,7 @@ Responses:
 | `SERVER_BUSY` | sent on connect when `max_clients` connections are already active, then closed |
 | `FAULT_INJECTION_DISABLED` | `simulate_failure` / `simulate_crash` sent to a server without fault injection |
 | `NOT_PRIMARY` | bonus: the server is the backup; response has `primary_hint` (the other server) |
+| `NO_QUORUM` | bonus 2: the primary has no valid lease from the witness (isolated or witness down), so it refuses to serve; retry on the other server |
 | `INTERNAL_ERROR` | unexpected exception; the transaction was rolled back |
 
 After an error (even random bytes) the connection stays open for the next line.
