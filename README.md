@@ -382,3 +382,4 @@ restart keeps state and holds the lease for one TTL) and, with real processes: l
 fences the primary when the witness dies (and B does not promote), no promotion while the lease
 is held (A–B cut), isolated primary fences then B promotes + stale-epoch records/heartbeats are
 refused, a lone restart does not become primary, a restart without the witness does not serve.
+
