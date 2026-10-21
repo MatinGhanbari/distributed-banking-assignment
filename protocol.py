@@ -41,6 +41,7 @@ class Request:
     amount_cents: int | None = None
     to_account: str | None = None
     simulate_failure: bool = False      # debug-only fault injection flag
+    simulate_crash: bool = False        # debug-only: kill the process after replicating (bonus)
 
 
 def parse_line(raw: bytes) -> dict:
@@ -108,7 +109,8 @@ def validate(obj: dict, generated_id: str) -> Request:
                         f"unsupported action '{action}'; use one of {sorted(ACTIONS)}")
     req = Request(request_id=rid or generated_id, client_supplied_id=rid is not None,
                   action=action, account=_require_str(obj, "account"),
-                  simulate_failure=obj.get("simulate_failure") is True)
+                  simulate_failure=obj.get("simulate_failure") is True,
+                  simulate_crash=obj.get("simulate_crash") is True)
 
     if action in MUTATING_ACTIONS:
         if obj.get("amount") is None:

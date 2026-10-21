@@ -4,6 +4,8 @@
 Interactive:  python3 client.py --host 192.168.75.10
 One-shot:     python3 client.py --host 192.168.75.10 deposit A1001 100
               (prints the JSON response; exit code 0 = success, 1 = error)
+Cluster:      python3 client.py --servers 192.168.75.10:5000,192.168.75.11:5000
+              (bonus: automatic failover - retries the SAME request on the other server)
 
 Commands: balance ACC | deposit ACC AMOUNT | withdraw ACC AMOUNT |
           transfer FROM TO AMOUNT | raw TEXT | rawhex HEX | help | quit
@@ -16,6 +18,7 @@ import select
 import shlex
 import socket
 import sys
+import time
 import uuid
 
 JSON_NUMBER = re.compile(r"-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?")
@@ -76,15 +79,77 @@ class BankClient:
         self.close()
 
 
+class FailoverClient:
+    """Bonus: talks to a primary/backup pair and survives the primary's crash.
+
+    Every request gets a request_id. If the connection breaks, times out, or the server
+    answers NOT_PRIMARY / SERVER_BUSY, the SAME bytes (same request_id) are sent to the next
+    server, with a small backoff, until an answer arrives or `deadline` seconds pass.
+    Because the servers remember processed request_ids (and replicate them), a retry can
+    never apply a transaction twice: it is either applied once or answered with replayed=true.
+    """
+    RETRY_CODES = {"NOT_PRIMARY", "SERVER_BUSY"}
+
+    def __init__(self, servers, deadline: float = 30.0, timeout: float = 5.0, on_retry=None):
+        self.servers = [parse_server(s) for s in servers]
+        self.deadline, self.timeout, self.on_retry = deadline, timeout, on_retry
+        self.index = 0                  # server we currently talk to
+        self.conn = None
+
+    def request(self, **fields):
+        """Returns (response, info) where info = {"server", "attempts", "elapsed"}."""
+        fields.setdefault("request_id", f"cli-{uuid.uuid4().hex[:12]}")
+        return self.call_raw(json.dumps(fields).encode("utf-8"))
+
+    def call_raw(self, payload: bytes):
+        start, attempts = time.monotonic(), 0
+        while True:
+            host, port = self.servers[self.index]
+            attempts += 1
+            try:
+                if self.conn is None:
+                    self.conn = BankClient(host, port, timeout=self.timeout)
+                resp = self.conn.raw(payload)
+                if resp is None:
+                    raise ConnectionError("server closed the connection")
+                if resp.get("code") not in self.RETRY_CODES:
+                    return resp, {"server": f"{host}:{port}", "attempts": attempts,
+                                  "elapsed": time.monotonic() - start}
+                reason = resp["code"]
+            except (OSError, ValueError) as exc:          # refused, reset, timeout, garbage
+                reason = f"{type(exc).__name__}: {exc}"
+            self.close()
+            if time.monotonic() - start > self.deadline:
+                raise TimeoutError(f"no server answered within {self.deadline}s (last: {reason})")
+            if self.on_retry:
+                self.on_retry(f"{host}:{port}", reason, attempts)
+            self.index = (self.index + 1) % len(self.servers)
+            # Try the other server at once; back off a little more after each full round.
+            time.sleep(min(1.0, 0.1 * 2 ** ((attempts - 1) // len(self.servers))))
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+
+def parse_server(text: str):
+    host, _, port = text.strip().rpartition(":")
+    return (host, int(port)) if host else (text.strip(), 5000)
+
+
 def add_server_args(ap: argparse.ArgumentParser) -> None:
     """--host/--port options shared by client.py and the demo scripts."""
     ap.add_argument("--host", default=os.environ.get("BANK_SERVER_HOST"),
                     help="server IP address (default: $BANK_SERVER_HOST), e.g. 192.168.75.10")
     ap.add_argument("--port", type=int, default=int(os.environ.get("BANK_SERVER_PORT", 5000)))
+    ap.add_argument("--servers", default=os.environ.get("BANK_SERVERS"),
+                    help="bonus: comma-separated HOST:PORT list of the primary/backup pair, "
+                         "e.g. 192.168.75.10:5000,192.168.75.11:5000 (default: $BANK_SERVERS)")
 
 
 def require_host(ap: argparse.ArgumentParser, args) -> None:
-    if not args.host:
+    if not args.host and not getattr(args, "servers", None):
         ap.error("server host is required: use --host <server-ip> or set BANK_SERVER_HOST")
 
 
@@ -153,6 +218,8 @@ def main():
     ap.add_argument("command", nargs="*", help="one-shot command, e.g. deposit A1001 100")
     args = ap.parse_args()
     require_host(ap, args)
+    if args.servers:
+        return failover_main(args)
 
     try:
         client = BankClient(args.host, args.port)
@@ -194,6 +261,51 @@ def main():
             except OSError as exc:
                 print(f"!! connection error: {exc}")
                 break
+
+
+def failover_main(args):
+    """Client mode for the primary/backup cluster (bonus)."""
+    def on_retry(server, reason, attempt):
+        print(f"     retry #{attempt}: {server} -> {reason}; trying next server", file=sys.stderr)
+
+    client = FailoverClient(args.servers.split(","), on_retry=on_retry)
+
+    def send(words):
+        resp, info = client.call_raw(build_payload(
+            words, args.request_id if args.command else None, args.simulate_failure))
+        return resp, info
+
+    if args.command:
+        try:
+            resp, info = send(args.command)
+        except (ValueError, TimeoutError) as exc:
+            sys.exit(str(exc))
+        print(json.dumps(resp))
+        print(f"(answered by {info['server']} after {info['attempts']} attempt(s))", file=sys.stderr)
+        sys.exit(0 if resp.get("status") == "success" else 1)
+
+    print(f"Cluster mode: {args.servers}. Type 'help' for commands (raw/rawhex not available here).")
+    while True:
+        try:
+            line = input("bank> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if line in ("quit", "exit"):
+            break
+        if line == "help":
+            print(HELP)
+            continue
+        if not line:
+            continue
+        try:
+            resp, info = send(shlex.split(line))
+            print(pretty(resp) + f"   <- {info['server']}")
+            if args.verbose:
+                print("     " + json.dumps(resp))
+        except (ValueError, TimeoutError) as exc:
+            print(f"     {exc}")
+    client.close()
 
 
 if __name__ == "__main__":

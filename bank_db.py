@@ -11,6 +11,7 @@ Each client thread owns its own Bank object / sqlite3 connection (connections ar
 not shared between threads).
 """
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -31,6 +32,11 @@ CREATE TABLE IF NOT EXISTS processed_requests (
     fingerprint   TEXT NOT NULL,      -- action/account/amount, detects id reuse
     response_json TEXT NOT NULL,      -- the exact response we sent the first time
     created_at    TEXT NOT NULL
+);
+-- Cluster mode only (bonus): persisted role, epoch and last log sequence number.
+CREATE TABLE IF NOT EXISTS node_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 """
 
@@ -57,12 +63,24 @@ def init_db(db_path: str) -> None:
         conn.close()
 
 
+def get_state(conn: sqlite3.Connection, key: str, default=None):
+    row = conn.execute("SELECT value FROM node_state WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_state(conn: sqlite3.Connection, key: str, value) -> None:
+    conn.execute("INSERT OR REPLACE INTO node_state VALUES (?, ?)", (key, str(value)))
+
+
 class Bank:
     """Executes validated requests against the database (one instance per client thread)."""
 
-    def __init__(self, db_path: str, fault_injection: bool = False):
+    def __init__(self, db_path: str, fault_injection: bool = False, replicator=None):
         self.conn = connect(db_path)
         self.fault_injection = fault_injection
+        # Cluster mode (bonus): object with replicate(conn, request_id, balances, processed_row).
+        # None in single-server mode (part 1), where nothing is replicated.
+        self.replicator = replicator
 
     def close(self):
         self.conn.close()
@@ -108,10 +126,11 @@ class Bank:
 
     # ---- public entry point -------------------------------------------------------
     def execute(self, req: Request) -> dict:
-        if req.simulate_failure and not self.fault_injection:
+        if (req.simulate_failure or req.simulate_crash) and not self.fault_injection:
             # Refuse instead of silently ignoring the flag, so a demo never moves real money.
             raise BankError("FAULT_INJECTION_DISABLED",
-                            "simulate_failure requires a server started with fault injection enabled")
+                            "simulate_failure/simulate_crash require a server started with "
+                            "fault injection enabled")
         if req.action == "balance":
             # A single SELECT is atomic on its own; WAL gives it a consistent snapshot.
             return self._ok(req, self._balance(req.account))
@@ -148,12 +167,21 @@ class Bank:
                 to_cents = self._balance(req.to_account)
                 resp.update(to_account=req.to_account, to_balance=money(to_cents),
                             to_balance_cents=to_cents)
+            processed_row = None
             if req.client_supplied_id:
                 # Stored in the same transaction as the balance change: both or neither.
-                self.conn.execute(
-                    "INSERT INTO processed_requests VALUES (?, ?, ?, ?)",
-                    (req.request_id, fingerprint, json.dumps(resp),
-                     datetime.now(timezone.utc).isoformat()))
+                processed_row = (req.request_id, fingerprint, json.dumps(resp),
+                                 datetime.now(timezone.utc).isoformat())
+                self.conn.execute("INSERT INTO processed_requests VALUES (?, ?, ?, ?)",
+                                  processed_row)
+            if self.replicator is not None:
+                # Bonus: send the result to the backup and wait for its ack BEFORE our COMMIT.
+                touched = {req.account: resp["balance_cents"]}
+                if req.to_account:
+                    touched[req.to_account] = resp["to_balance_cents"]
+                self.replicator.replicate(self.conn, req.request_id, touched, processed_row)
+                if self.fault_injection and req.simulate_crash:
+                    os._exit(137)                # debug: die after replicating, before COMMIT
         return resp                               # only reached after COMMIT succeeded
 
     @staticmethod

@@ -98,9 +98,141 @@ reason), `rejected_busy`, signal and start/stop events are logged too.
 
 ## 8. Limitations
 
-* One server process with one database file: the server is a single point of failure (no
-  replication). Writes are serialised, which is simple and correct but limits write throughput
+* In single-server mode the server is a single point of failure; the bonus cluster (section 9)
+  removes this for crash failures. Writes are serialised, which is simple and correct but limits write throughput
   (fine for this workload; under heavy contention some requests wait up to ~1 s for the lock).
 * `synchronous=FULL` protects against process crashes and power loss only if the disk honours
   fsync (on VMs this depends on the hypervisor's disk cache settings).
 * No authentication or encryption (plain TCP on a lab network).
+
+## 9. Advanced Bonus – primary/backup cluster with automatic failover
+
+### 9.1 Setup
+
+Two identical servers, **A** (192.168.75.10) and **B** (192.168.75.11), each with its own SQLite
+database; clients on 192.168.75.20. Port 5000 is for clients, port 6000 for replication
+(same newline-JSON framing). Exactly one node is **primary** and serves clients; the other is the
+**backup**: it keeps a copy of all data and answers clients with `NOT_PRIMARY` (+ `primary_hint`).
+Each node stores `role`, `epoch` and `last_lsn` in a `node_state` table in its own database, so a
+restarted node remembers what it was. The code is in `cluster.py` (~450 lines); without `--peer`
+none of it runs and the server behaves exactly as in part 1.
+
+### 9.2 Synchronous replication before the acknowledgement
+
+For every deposit/withdraw/transfer the primary does, in this order:
+
+1. `BEGIN IMMEDIATE`, validate, update balances, insert the `processed_requests` row (part 1);
+2. take the next log sequence number `lsn = last_lsn + 1` (stored in the same transaction);
+3. send a **replication record** `{lsn, epoch, request_id, new absolute balances of the touched
+   accounts, the processed_requests row (incl. the response JSON)}` to the backup and **wait for
+   its ack**;
+4. the backup applies the record in **one** local transaction (balances + processed row +
+   `last_lsn`) and acks only **after its COMMIT**;
+5. the primary COMMITs and only then replies to the client.
+
+Because `BEGIN IMMEDIATE` serialises all writers on the primary, records are produced and sent
+strictly in lsn order. The backup applies record `n` only if its `last_lsn == n-1`; a duplicate
+(`lsn <= last_lsn`) is acked without being applied again; a gap means the backup missed
+something and it answers `NEED_SNAPSHOT`. Absolute balances (not "+30") make a record safe to
+apply even if it were resent.
+
+When a backup connects (first start, restart, or after a network hiccup) the primary first sends
+a **full snapshot** (all accounts, all processed request ids, lsn, epoch) while holding its write
+lock, so no write can slip in between; only after the snapshot is acked does live replication
+start and only then is the backup marked **in sync**.
+
+**Degraded mode.** If the backup is unreachable (crashed, restarting, network down) the primary
+logs `degraded_mode` and continues alone – it chooses *availability* over keeping a second copy.
+Writes made in this mode exist only on the primary until the backup reconnects and receives a
+snapshot. This is also exactly where split-brain risk lives (see 9.6).
+
+### 9.3 Failure detection and automatic failover
+
+The primary sends a heartbeat every 0.5 s on the replication connection. The backup records the
+time of the last heartbeat/record. If it hears nothing for `failover_timeout` (3 s) **and it is in
+sync**, it promotes itself: in one transaction `epoch = epoch + 1`, `role = primary`; then it
+serves clients. No human is involved. A backup that never received a snapshot refuses to promote
+(`cannot_promote` in the log), because its data may be old.
+
+**Epochs (terms)** stop an old primary from doing damage: every message carries the sender's
+epoch. A node rejects records/heartbeats from a lower epoch with `STALE_EPOCH`, and a primary that
+receives `STALE_EPOCH` (or sees a primary with a higher epoch) **steps down** to backup at once.
+Tested by freezing A with `kill -STOP` for 4 s: B promoted itself to epoch 2. When A was resumed,
+its first heartbeat was rejected, A stepped down, and it received a snapshot from B. Balances were
+identical on both.
+
+### 9.4 Client side: retry with the same request_id
+
+`client.FailoverClient` knows both addresses. Every request has a client-generated `request_id`.
+On a connection error, a timeout (3–5 s), `NOT_PRIMARY` or `SERVER_BUSY` it sends **the same
+bytes** (same id) to the next server, with a small growing backoff, until it gets an answer or a
+total deadline (30 s) expires. It then keeps talking to the server that answered.
+
+### 9.5 Why no transaction is lost and none is applied twice
+
+Look at a request R whose server A crashes at any moment:
+
+| A crashes … | state on B | what the client's retry on B does |
+|---|---|---|
+| before sending R's record | B never saw R | B (now primary) applies R **once** |
+| after sending, before B committed | B rolled back / never applied | applied **once** on B |
+| after B committed R, before A's COMMIT | B has R (A's local copy is lost, fine) | `replayed: true`, **not** applied again |
+| after A's COMMIT, before the reply | both have R | `replayed: true` |
+| after replying | both have R | no retry needed |
+
+* **No loss:** the primary acknowledges a write only after the backup has committed it
+  (step 3–5), so every acknowledged write is on B when A dies. B promotes only if it is in sync,
+  so it never takes over with old data.
+* **No double apply:** the `processed_requests` row travels in the **same** record and the
+  **same** backup transaction as the balance change: B has either both or neither. A retry with
+  the same id is therefore either a first application or a replay of the stored answer, and the
+  part-1 idempotency check runs inside `BEGIN IMMEDIATE`, so two concurrent retries cannot both
+  apply.
+* **Half-done requests:** a transaction that A did not commit is rolled back by SQLite on A. If it
+  had already reached B, it counts as done, and A gets it back when it rejoins (snapshot). If not,
+  it never happened. Either way the client's retry gives the right result. The test
+  `test_half_done_request_is_not_lost_or_doubled` forces the hardest case: with fault injection,
+  A calls `os._exit` after B acked but before A's COMMIT. The client gets no reply, retries on B,
+  receives `replayed: true`, and the money was withdrawn exactly once.
+* **No two primaries after a crash:** a restarting node first asks its peer (`hello`). If the
+  peer is primary with an epoch ≥ its own, it becomes backup and must receive a snapshot before
+  it may ever promote. A restarted A therefore never comes back as a second primary while B is
+  primary.
+* **Consistent balances:** each record carries the absolute balances computed under the
+  primary's write lock, in lsn order. Applying them in the same order reproduces exactly the
+  primary's state; the `CHECK(balance >= 0)` constraint holds on both nodes.
+
+**Measured (local, `demo/failover_demo.py --local`, 6 clients, 15 s, A killed with SIGKILL at a
+random moment between 3.8 s and 6.1 s, restarted at 10.5 s):** 4 runs, all PASS, with about
+2,300 acknowledged requests per run, split between A and B. In every run the 6 in-flight requests
+needed a retry, and the longest time with no acknowledgement was 4.0 s (3 s detection + promotion
++ client backoff). In 3 of the 4 runs one request had been replicated by A but never answered;
+its retry got `replayed: true`. B's last lsn at promotion was always exactly one more than A's
+acknowledged writes. Final balances matched initial + acknowledged deposits − withdrawals
+exactly, and the restarted A had the same balances as B.
+
+### 9.6 Limitations (honest list)
+
+* **Network partition / split brain (the "extreme" bonus) is not solved.** With two nodes, the
+  backup cannot tell "A crashed" from "the link to A is broken". If the link breaks while A is
+  alive, B promotes after 3 s while A continues in degraded mode. Clients that can still reach A
+  may write there, and when the link heals B's higher epoch wins: A steps down and is
+  overwritten by B's snapshot, so **A's writes made during the partition are lost**. Solving this
+  needs a third voter (quorum/majority, e.g. Raft) or a fencing mechanism.
+* **Same window for a single crash after a link hiccup:** if the replication link drops (A
+  degraded), A writes a few transactions alone and then crashes before the link is restored
+  (normally within 0.5 s), B can take over without those writes. Heartbeats carry `last_lsn`, so
+  a backup that notices it is behind marks itself out of sync and refuses to promote, but this
+  only helps if a heartbeat arrives before the crash.
+* **Double failure / restart order:** if both nodes are down, the node that comes back alone
+  starts as primary only if its persisted role is primary (it has seen no higher epoch). If A
+  restarts alone after B had been promoted, A does not know about epoch 2 and serves as primary
+  with older data. When B returns, B wins and A's new writes are discarded. A backup that
+  restarts alone stays backup (safe but unavailable) until the primary returns.
+* **Write latency:** every write waits for one network round trip plus an fsync on B; writes are
+  serialised cluster-wide. Fine for this assignment, not for high throughput.
+* **Snapshot = whole database** (including all processed request ids); fine for a demo DB.
+  A real system would use incremental catch-up from a log and expire old request ids.
+* The primary keeps the write lock while waiting for the backup's ack (max `repl_timeout` = 2 s);
+  if the backup is very slow, clients wait that long before the primary goes degraded.
+* The replication port is plain TCP without authentication, so only use it on the lab network.

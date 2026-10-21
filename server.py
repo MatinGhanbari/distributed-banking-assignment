@@ -8,6 +8,10 @@ State     : SQLite database shared by all threads (see bank_db.py).
 
 Usage: python3 server.py [--port 5000] [--max-clients 100] [--db bank.db] ...
 Config precedence: command line > environment variables > config.json > defaults.
+
+Bonus (primary/backup cluster, see cluster.py): start with --peer HOST:PORT, e.g.
+  python3 server.py --node-id A --initial-role primary --peer 192.168.75.11:6000
+Without --peer the server works exactly as a single server (part 1).
 """
 import argparse
 import json
@@ -24,6 +28,7 @@ from datetime import datetime, timezone
 
 import bank_db
 import protocol
+from cluster import Cluster
 from protocol import BankError
 
 DEFAULTS = {
@@ -35,6 +40,17 @@ DEFAULTS = {
     "max_line_bytes": 65536,          # longer request lines are rejected
     "client_idle_timeout": 300,       # seconds; frees the slot of a silent client
     "enable_fault_injection": False,  # debug only!
+    # --- bonus: primary/backup cluster (only used when "peer" is set) ---
+    "node_id": None,                  # e.g. "A" (default: hostname)
+    "peer": None,                     # peer's REPLICATION address, e.g. "192.168.75.11:6000"
+    "peer_client": None,              # peer's client address for NOT_PRIMARY hints (default peer-host:port)
+    "repl_host": "0.0.0.0",
+    "repl_port": 6000,
+    "initial_role": "backup",         # role on the very first start; later the persisted role wins
+    "heartbeat_interval": 0.5,        # seconds between heartbeats primary -> backup
+    "failover_timeout": 3.0,          # backup promotes itself after this much silence
+    "repl_timeout": 2.0,              # max wait for the backup's ack of one record
+    "startup_probe": 2.0,             # how long to look for the peer at startup
 }
 # config key -> (environment variable, type)
 ENV_VARS = {
@@ -46,6 +62,13 @@ ENV_VARS = {
     "max_line_bytes": ("BANK_MAX_LINE_BYTES", int),
     "client_idle_timeout": ("BANK_CLIENT_IDLE_TIMEOUT", float),
     "enable_fault_injection": ("BANK_ENABLE_FAULT_INJECTION", bool),
+    "node_id": ("BANK_NODE_ID", str),
+    "peer": ("BANK_PEER", str),
+    "peer_client": ("BANK_PEER_CLIENT", str),
+    "repl_port": ("BANK_REPL_PORT", int),
+    "initial_role": ("BANK_INITIAL_ROLE", str),
+    "heartbeat_interval": ("BANK_HEARTBEAT_INTERVAL", float),
+    "failover_timeout": ("BANK_FAILOVER_TIMEOUT", float),
 }
 
 log = logging.getLogger("bank")
@@ -66,6 +89,14 @@ def load_config(argv=None) -> dict:
     ap.add_argument("--log-file", dest="log_file")
     ap.add_argument("--enable-fault-injection", dest="enable_fault_injection",
                     action="store_const", const=True, help="DEBUG ONLY: honour simulate_failure")
+    bonus = ap.add_argument_group("primary/backup cluster (bonus)")
+    bonus.add_argument("--node-id", dest="node_id")
+    bonus.add_argument("--peer", help="peer's replication address HOST:PORT (enables cluster mode)")
+    bonus.add_argument("--peer-client", dest="peer_client", help="peer's client address HOST:PORT")
+    bonus.add_argument("--repl-port", dest="repl_port", type=int)
+    bonus.add_argument("--initial-role", dest="initial_role", choices=["primary", "backup"])
+    bonus.add_argument("--heartbeat-interval", dest="heartbeat_interval", type=float)
+    bonus.add_argument("--failover-timeout", dest="failover_timeout", type=float)
     args = ap.parse_args(argv)
 
     cfg = dict(DEFAULTS)
@@ -83,6 +114,9 @@ def load_config(argv=None) -> dict:
     cfg["max_clients"] = int(cfg["max_clients"])
     if cfg["max_clients"] < 1:
         ap.error("max_clients must be >= 1")
+    if cfg["initial_role"] not in ("primary", "backup"):
+        ap.error("initial_role must be 'primary' or 'backup'")
+    cfg["node_id"] = cfg["node_id"] or socket.gethostname()
     return cfg
 
 
@@ -130,7 +164,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
         self.ip, self.port = self.client_address[:2]
         self.request.settimeout(cfg["client_idle_timeout"])
         rfile = self.request.makefile("rb")
-        bank = bank_db.Bank(cfg["db_path"], cfg["enable_fault_injection"])
+        bank = bank_db.Bank(cfg["db_path"], cfg["enable_fault_injection"], replicator=srv.cluster)
         started, handled, reason = time.monotonic(), 0, "client_closed"
         log_event("connect", client_ip=self.ip, client_port=self.port,
                   active_clients=srv.active_count())
@@ -175,9 +209,14 @@ class ClientHandler(socketserver.BaseRequestHandler):
             obj = protocol.parse_line(line)
             request_id = protocol.request_id_of(obj, request_id)
             action, account = obj.get("action"), obj.get("account")   # for logging only
+            cluster = self.server.cluster
+            if cluster is not None and not cluster.is_primary():
+                raise cluster.not_primary_error()                    # backup: redirect client
             req = protocol.validate(obj, request_id)
             response = bank.execute(req)
         except BankError as err:
+            if getattr(err, "step_down_epoch", None) is not None:   # a newer primary exists
+                self.server.cluster.step_down(err.step_down_epoch, "backup has a higher epoch")
             response = protocol.error_response(request_id, err,
                                                account if isinstance(account, str) else None)
         except Exception as exc:                            # bug, DB error, injected fault...
@@ -199,8 +238,9 @@ class BankServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     request_queue_size = 128
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, cluster=None):
         self.cfg = cfg
+        self.cluster = cluster          # None = single server (part 1)
         self.lock = threading.Lock()
         self.active = set()             # sockets of currently served clients
         self.stopping = threading.Event()
@@ -258,8 +298,12 @@ def main(argv=None):
     cfg = load_config(argv)
     setup_logging(cfg["log_file"])
     bank_db.init_db(cfg["db_path"])
+    cluster = None
     try:
-        server = BankServer(cfg)
+        if cfg["peer"]:                       # bonus: join the primary/backup pair first
+            cluster = Cluster(cfg, log_event)
+            cluster.start()
+        server = BankServer(cfg, cluster)
     except OSError as exc:
         log_event("startup_failed", error=str(exc), host=cfg["host"], port=cfg["port"])
         return 1
@@ -276,7 +320,9 @@ def main(argv=None):
     threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True).start()
     log_event("server_started", host=cfg["host"], port=cfg["port"], max_clients=cfg["max_clients"],
               db_path=os.path.abspath(cfg["db_path"]),
-              fault_injection=cfg["enable_fault_injection"], pid=os.getpid())
+              fault_injection=cfg["enable_fault_injection"], pid=os.getpid(),
+              **({"node_id": cfg["node_id"], "role": cluster.role, "epoch": cluster.epoch}
+                 if cluster else {}))
     if cfg["enable_fault_injection"]:
         log_event("warning", message="FAULT INJECTION ENABLED - debug use only")
 
@@ -284,6 +330,8 @@ def main(argv=None):
         pass
     log_event("server_stopping", active_clients=server.active_count())
     server.stop()
+    if cluster:
+        cluster.stop()
     log_event("server_stopped")
     return 0
 

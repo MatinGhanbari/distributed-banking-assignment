@@ -6,5 +6,16 @@
   "log_file": "logs/server.log",
   "max_line_bytes": 65536,
   "client_idle_timeout": 300,
-  "enable_fault_injection": false
+  "enable_fault_injection": false,
+
+  "node_id": null,
+  "peer": null,
+  "peer_client": null,
+  "repl_host": "0.0.0.0",
+  "repl_port": 6000,
+  "initial_role": "backup",
+  "heartbeat_interval": 0.5,
+  "failover_timeout": 3.0,
+  "repl_timeout": 2.0,
+  "startup_probe": 2.0
 }
