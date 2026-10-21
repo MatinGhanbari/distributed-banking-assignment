@@ -17,8 +17,7 @@ The design is explained in [docs/design-notes.md](docs/design-notes.md).
 [Bonus 2 below](#bonus-2-split-brain-prevention-witness--leases).
 
 **Submission material:** report (Persian, 5 A4 pages): [docs/report.pdf](docs/report.pdf) ·
-video script: [docs/video-script.md](docs/video-script.md) ·
-demo video: submitted via the course LMS (`video.mp4`, about 12:49)
+demo video: submitted via the course LMS (`video.mp4`, about 6:24, 2x speed)
 
 ## Files
 
