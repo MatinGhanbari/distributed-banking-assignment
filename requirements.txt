@@ -1,0 +1,3 @@
+# No third-party packages are needed: the project uses the Python standard library only
+# (socket, socketserver, threading, sqlite3, json, decimal, logging, argparse, unittest).
+# Required: Python >= 3.10 (developed for Python 3.12 on Ubuntu 24.04; also tested on 3.13).

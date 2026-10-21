@@ -1,0 +1,10 @@
+{
+  "host": "0.0.0.0",
+  "port": 5000,
+  "max_clients": 100,
+  "db_path": "bank.db",
+  "log_file": "logs/server.log",
+  "max_line_bytes": 65536,
+  "client_idle_timeout": 300,
+  "enable_fault_injection": false
+}
